@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@particle-network/aa": "^2.0.2",
     "@particle-network/auth-core-modal": "^1.5.1",
     "@particle-network/authkit": "^2.0.19",
     "@react-oauth/google": "^0.12.2",

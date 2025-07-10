@@ -1,111 +1,179 @@
 "use client";
-import React, { useState, useEffect } from "react";
-import type { NextPage } from "next";
 
-// Import Particle Auth hooks and provider
+import { useEffect, useMemo, useState } from "react";
+import type { NextPage } from "next";
 import {
   useEthereum,
   useConnect,
   useAuthCore,
 } from "@particle-network/authkit";
 import { AuthType } from "@particle-network/auth-core";
-import { ethers, type Eip1193Provider } from "ethers"; // Eip1193Provider is the interface for the injected BrowserProvider
-
-// UI component to display links to the Particle sites
-import LinksGrid from "./components/Links";
-import Header from "./components/Header";
-import TxNotification from "./components/TxNotification";
-
-// Import the utility functions
+import { ethers, type Eip1193Provider } from "ethers";
+import { GoogleLogin } from "@react-oauth/google";
+import { jwtDecode } from "jwt-decode";
 import { formatBalance, truncateAddress } from "./utils/utils";
-import { loginRequest, decodeJWT } from "./utils/jwtUtils";
+import { useSmartAccount } from "./context/SmartAccountContext";
+import { useCallback } from "react";
+// AA imports
+import {
+  AAWrapProvider,
+  SendTransactionMode,
+  SmartAccount,
+} from "@particle-network/aa";
+
+import { sepolia, baseSepolia } from "@particle-network/authkit/chains"; // Chains are imported here
 
 const Home: NextPage = () => {
-  // Hooks to manage logins, data display, and transactions
   const { connect, disconnect, connectionStatus } = useConnect();
-  const { address, provider, chainInfo, signMessage } = useEthereum();
+  const { provider, chainInfo, signMessage } = useEthereum();
   const { userInfo } = useAuthCore();
+  const [jwtData, setJwtData] = useState<any>(null);
+  const [balance, setBalance] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [address, setAddress] = useState<string>("");
+  const { selectedAccount, setSelectedAccount } = useSmartAccount();
+  const [recipientAddress, setRecipientAddress] = useState<string>("");
+  const [transactionHash, setTransactionHash] = useState<string | null>(null);
+  const [isSending, setIsSending] = useState(false);
 
-  const [balance, setBalance] = useState<string>(""); // states for fetching and display the balance
-  const [recipientAddress, setRecipientAddress] = useState<string>(""); // states to get the address to send tokens to from the UI
-  const [selectedProvider, setSelectedProvider] = useState<string>("ethers"); // states to handle which providers signs the message
-  const [transactionHash, setTransactionHash] = useState<string | null>(null); // states for the transaction hash
-  const [isSending, setIsSending] = useState<boolean>(false); // state to display 'Sending...' while waiting for a hash
-  const [username, setUsername] = useState<string>(""); // state to store the input username
-  const [jwtData, setJwtData] = useState<any>(null); // state to store the decoded JWT data
-
-  // Create provider instance with ethers V6
-  // use new ethers.providers.Web3Provider(provider, "any"); for Ethers V5
-  const ethersProvider = new ethers.BrowserProvider(
-    provider as Eip1193Provider,
-    "any"
+  // Set up and configure the smart account
+  const smartAccount = useMemo(
+    () =>
+      new SmartAccount(provider, {
+        projectId: process.env.NEXT_PUBLIC_PROJECT_ID!,
+        clientKey: process.env.NEXT_PUBLIC_CLIENT_KEY!,
+        appId: process.env.NEXT_PUBLIC_APP_ID!,
+        aaOptions: {
+          accountContracts: {
+            BICONOMY: [
+              {
+                version: "2.0.0",
+                chainIds: [sepolia.id, baseSepolia.id],
+              },
+            ],
+            SIMPLE: [
+              {
+                version: "1.0.0",
+                chainIds: [sepolia.id, baseSepolia.id],
+              },
+            ],
+          },
+        },
+      }),
+    [provider]
   );
 
-  // Fetch the balance when userInfo or chainInfo changes
-  useEffect(() => {
-    if (userInfo) {
-      fetchBalance();
-    }
-  }, [userInfo, chainInfo]);
+  // Function to create ethers provider based on selected mode. This is for ethers V6
+  // use new ethers.providers.Web3Provider(new AAWrapProvider(smartAccount, mode), "any"); for Ethers V5
+  const createEthersProvider = useCallback(() => {
+    return new ethers.BrowserProvider(
+      new AAWrapProvider(
+        smartAccount,
+        SendTransactionMode.Gasless
+      ) as Eip1193Provider,
+      "any"
+    );
+  }, [smartAccount]);
 
-  // Fetch the user's balance in Ether
-  const fetchBalance = async () => {
+  // Initialize the ethers provider
+  const [ethersProvider, setEthersProvider] = useState(() =>
+    createEthersProvider()
+  );
+
+  const fetchBalance = useCallback(async () => {
     try {
-      const signer = await ethersProvider.getSigner();
-      const address = await signer.getAddress();
+      // Get the smart account address
+      const address = await smartAccount.getAddress();
       const balanceResponse = await ethersProvider.getBalance(address);
       const balanceInEther = ethers.formatEther(balanceResponse); // ethers V5 will need the utils module for those convertion operations
 
       // Format the balance using the utility function
       const fixedBalance = formatBalance(balanceInEther);
 
+      setAddress(address);
       setBalance(fixedBalance);
-    } catch (error) {
-      console.error("Error fetching balance:", error);
+    } catch (err) {
+      console.error("Error fetching balance:", err);
     }
-  };
+  }, [ethersProvider, smartAccount]);
 
-  // Handle user login
-  const handleLogin = async () => {
+  useEffect(() => {
+    if (userInfo) {
+      console.log(userInfo);
+      fetchBalance();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userInfo, chainInfo]);
+
+  const handleAccountChange = async (
+    e: React.ChangeEvent<HTMLSelectElement>
+  ) => {
+    setIsLoading(true);
+    const newAccountName = e.target.value;
+    setSelectedAccount(newAccountName);
+
+    // Add a delay to allow the context to update before fetching the balance
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const version = newAccountName === "BICONOMY" ? "2.0.0" : "1.0.0";
+
     try {
-      const token = await loginRequest(username);
+      smartAccount.setSmartAccountContract({
+        name: newAccountName as "BICONOMY" | "SIMPLE",
+        version: version,
+      });
 
-      if (token) {
-        const decodedData = await decodeJWT(token);
-        // console.log(decodedData);
-        // Use the returned JWT to connect with Particle Auth
-        if (!userInfo) {
-          await connect({
-            provider: AuthType.jwt,
-            thirdpartyCode: token,
-          });
-        }
-
-        setJwtData(decodedData);
-      }
+      await fetchBalance();
     } catch (error) {
-      console.error("Error during login:", error);
-      alert(`Error during login: ${(error as any).message}`);
+      console.error("Error switching smart account:", error);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // Handle user disconnect
+  // Update ethers provider when selectedMode changes
+  useEffect(() => {
+    setEthersProvider(createEthersProvider());
+  }, [createEthersProvider]);
+
+  const handleLogin = async (token: string) => {
+    setIsLoading(true);
+    try {
+      const decoded = jwtDecode(token);
+      setJwtData(decoded);
+      console.log(decoded);
+      await connect({
+        provider: AuthType.jwt,
+        thirdpartyCode: token,
+      });
+    } catch (err) {
+      console.error("Login failed", err);
+      alert("Login failed: " + (err as any).message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const handleDisconnect = async () => {
+    setIsLoading(true);
     try {
       await disconnect();
-    } catch (error) {
-      console.error("Error disconnecting:", error);
+      setJwtData(null);
+    } catch (err) {
+      console.error("Disconnect failed", err);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // Execute an Ethereum transaction
+  // Execute an Ethereum transaction using Ethers provider
   // Simple transfer in this example
-  const executeTxEvm = async () => {
+  const executeTxEthers = async () => {
     setIsSending(true);
     const signer = await ethersProvider.getSigner();
     const tx = {
       to: recipientAddress,
-      value: ethers.parseEther("0.01"),
+      value: ethers.parseEther("0.001"),
       data: "0x", // data is needed only when interacting with smart contracts. 0x equals to zero and it's here for demonstration only
     };
 
@@ -114,6 +182,7 @@ const Home: NextPage = () => {
       const txReceipt = await txResponse.wait();
       if (txReceipt) {
         setTransactionHash(txReceipt.hash);
+        console.log(txReceipt.hash);
       } else {
         console.error("Transaction receipt is null");
       }
@@ -124,171 +193,234 @@ const Home: NextPage = () => {
     }
   };
 
-  // Sign a message using ethers as provider
-  const signMessageEthers = async () => {
-    const signer = await ethersProvider.getSigner();
-    const signerAddress = await signer.getAddress();
-
-    const message = "Gm Particle! Signing with ethers.";
-
-    try {
-      const result = await signMessage(message);
-      alert(`Signed Message: ${result} by address ${signerAddress}.`);
-    } catch (error: any) {
-      // This is how you can display errors to the user
-      alert(`Error with code ${error.code}: ${error.message}`);
-      console.error("personal_sign", error);
-    }
-  };
-
-  // Sign message using Particle Auth Natively
-  const signMessageParticle = async () => {
-    const message = "Gm Particle! Signing with Particle Auth.";
-
-    try {
-      const result = await signMessage(message);
-      alert(`Signed Message: ${result} by address ${address}.`);
-    } catch (error: any) {
-      // This is how you can display errors to the user
-      alert(`Error with code ${error.code}: ${error.message}`);
-      console.error("personal_sign", error);
-    }
-  };
-
-  // The UI
   return (
-    <div className="min-h-screen flex flex-col items-center justify-between p-8 bg-black text-white">
-      <Header />
-      <main className="flex-grow flex flex-col items-center justify-center w-full max-w-6xl mx-auto">
-        {/*
-            UI starts with a condition. If userInfo is undefined, the user is not logged in so the connect button is displayed.
-      */}
+    <div className="min-h-screen bg-gray-900">
+      <div className="container mx-auto px-4 py-8">
         {!userInfo ? (
-          <div className="flex flex-col items-center">
-            <input
-              type="text"
-              placeholder="Enter your username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="mb-4 p-2 w-64 rounded border border-gray-700 bg-gray-900 text-white focus:outline-none focus:ring-2 focus:ring-purple-400"
-            />
-            <button
-              className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded transition duration-300 ease-in-out transform hover:scale-105 shadow-lg"
-              onClick={handleLogin}
-            >
-              Sign in with Particle
-            </button>
+          <div className="max-w-md mx-auto mt-20">
+            {/* Header */}
+            <div className="text-center mb-8">
+              <div className="w-16 h-16 bg-blue-600 rounded-xl mx-auto mb-4 flex items-center justify-center">
+                <svg
+                  className="w-8 h-8 text-white"
+                  fill="currentColor"
+                  viewBox="0 0 20 20"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-6-3a2 2 0 11-4 0 2 2 0 014 0zm-2 4a5 5 0 00-4.546 2.916A5.986 5.986 0 0010 16a5.986 5.986 0 004.546-2.084A5 5 0 0010 11z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+              </div>
+              <h1 className="text-3xl font-bold text-white mb-2">
+                Particle Auth
+              </h1>
+              <p className="text-gray-400">
+                Sign in with Google to access your wallet
+              </p>
+            </div>
+
+            {/* Login Card */}
+            <div className="bg-gray-800 rounded-2xl shadow-lg border border-gray-700 p-8">
+              <div className="text-center">
+                <h2 className="text-xl font-semibold text-white mb-6">
+                  Welcome
+                </h2>
+                <div className="relative">
+                  {isLoading && (
+                    <div className="absolute inset-0 bg-gray-800/80 rounded-lg flex items-center justify-center z-10">
+                      <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                    </div>
+                  )}
+                  <GoogleLogin
+                    onSuccess={(res) => {
+                      const token = res.credential;
+                      if (token) handleLogin(token);
+                    }}
+                    onError={() => console.log("Google login failed")}
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 w-full">
-            <div className="border border-purple-500 p-6 rounded-lg">
-              {/*
-            In this card we display info from Particle Auth
-            This area shocases how to fetch various kind of data from Particle Auth directly.
-              */}
-              <h2 className="text-2xl font-bold mb-2 text-white">
-                Accounts info
-              </h2>
-              <div className="flex flex-col">
-                <h2 className="text-lg font-semibold mb-2 text-white">
-                  Name: {jwtData ? jwtData.name : ""}
-                </h2>
-                <h2 className="text-lg font-semibold mb-2 text-white">
-                  ID: {jwtData ? jwtData.sub : ""}
-                </h2>
-                <h2 className="text-lg font-semibold mb-2 text-white">
-                  Issuer: {jwtData ? jwtData.iss : ""}
-                </h2>
-              </div>
-              <h2 className="text-lg font-semibold mb-2 text-white">
-                Status: {connectionStatus}
-              </h2>
+          <div className="max-w-4xl mx-auto">
+            {/* Header */}
+            <div className="mb-8">
+              <h1 className="text-3xl font-bold text-white mb-2">Dashboard</h1>
+              <p className="text-gray-400">Manage your wallet and account</p>
+            </div>
 
-              <h2 className="text-lg font-semibold mb-2 text-white">
-                Address: <code>{truncateAddress(address || "")}</code>
-              </h2>
-              <h3 className="text-lg mb-2 text-gray-400">
-                Chain: {chainInfo.name}
-              </h3>
-              <div className="flex items-center">
-                <h3 className="text-lg font-semibold text-purple-400 mr-2">
-                  Balance: {balance} {chainInfo.nativeCurrency.symbol}
-                </h3>
-                <button
-                  className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-1 px-2 rounded transition duration-300 ease-in-out transform hover:scale-105 shadow-lg flex items-center"
-                  onClick={fetchBalance}
-                >
-                  🔄
-                </button>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              {/* Account Information */}
+              <div className="bg-gray-800 rounded-2xl shadow-lg border border-gray-700 p-6">
+                <h2 className="text-xl font-semibold text-white mb-6">
+                  Account Information
+                </h2>
+
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Name</span>
+                    <span className="text-white">{jwtData?.name}</span>
+                  </div>
+
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Email</span>
+                    <span className="text-white">{jwtData?.email}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Issuer</span>
+                    <span className="text-white">{jwtData?.iss}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Status</span>
+                    <span
+                      className={`px-3 py-1 rounded-full text-sm font-medium ${
+                        connectionStatus === "connected"
+                          ? "bg-green-900/50 text-green-400 border border-green-800"
+                          : "bg-yellow-900/50 text-yellow-400 border border-yellow-800"
+                      }`}
+                    >
+                      {connectionStatus}
+                    </span>
+                  </div>
+
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Address</span>
+                    <code className="text-sm bg-gray-700 px-2 py-1 rounded text-blue-400 border border-gray-600">
+                      {truncateAddress(address || "")}
+                    </code>
+                  </div>
+
+                  <div className="flex justify-between items-center py-3 border-b border-gray-700">
+                    <span className="text-gray-400 font-medium">Network</span>
+                    <span className="text-white">{chainInfo.name}</span>
+                  </div>
+
+                  <div className="flex justify-between items-center py-3">
+                    <span className="text-gray-400 font-medium">Balance</span>
+                    <span className="text-white font-semibold">
+                      {balance} {chainInfo.nativeCurrency.symbol}
+                    </span>
+                  </div>
+                </div>
               </div>
-              <div>
-                <button
-                  className="mt-4 bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-300 ease-in-out transform hover:scale-105 shadow-lg"
-                  onClick={handleDisconnect}
-                >
-                  Disconnect
-                </button>
+
+              {/* Actions */}
+              <div className="bg-gray-800 rounded-2xl shadow-lg border border-gray-700 p-6">
+                <h2 className="text-xl font-semibold text-white mb-6">
+                  Actions
+                </h2>
+
+                <div className="space-y-4">
+                  {/* Recipient Address Input */}
+                  <div className="flex flex-col space-y-2">
+                    <label
+                      htmlFor="recipient-address"
+                      className="text-sm font-medium text-gray-300"
+                    >
+                      Recipient Address
+                    </label>
+                    <input
+                      id="recipient-address"
+                      type="text"
+                      value={recipientAddress}
+                      onChange={(e) => setRecipientAddress(e.target.value)}
+                      placeholder="Enter recipient address"
+                      className="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5"
+                    />
+                  </div>
+
+                  {/* Smart Account Selector */}
+                  <div className="flex flex-col space-y-2 mb-4">
+                    <label
+                      htmlFor="account-selector"
+                      className="text-sm font-medium text-gray-300"
+                    >
+                      Smart Account
+                    </label>
+                    <select
+                      id="account-selector"
+                      value={selectedAccount}
+                      onChange={handleAccountChange}
+                      disabled={isLoading}
+                      className="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 disabled:opacity-50"
+                    >
+                      <option value="BICONOMY">Default Account</option>
+                      <option value="SIMPLE">Second Account</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={executeTxEthers}
+                    disabled={isSending || !recipientAddress}
+                    className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white font-medium py-3 px-4 rounded-xl transition-colors duration-200 flex items-center justify-center space-x-2 border border-green-500 hover:border-green-400 disabled:border-gray-500"
+                  >
+                    {isSending ? (
+                      <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                    ) : (
+                      <span>Send 0.001 ETH</span>
+                    )}
+                  </button>
+
+                  {transactionHash && (
+                    <div className="text-center text-sm text-green-400 break-all">
+                      Success! Tx Hash: {transactionHash}
+                    </div>
+                  )}
+
+                  <button
+                    onClick={handleDisconnect}
+                    disabled={isLoading}
+                    className="w-full bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white font-medium py-3 px-4 rounded-xl transition-colors duration-200 flex items-center justify-center space-x-2 border border-red-500 hover:border-red-400 disabled:border-gray-500"
+                  >
+                    {isLoading ? (
+                      <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                    ) : (
+                      <>
+                        <svg
+                          className="w-5 h-5"
+                          fill="currentColor"
+                          viewBox="0 0 20 20"
+                        >
+                          <path
+                            fillRule="evenodd"
+                            d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z"
+                            clipRule="evenodd"
+                          />
+                        </svg>
+                        <span>Disconnect</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* Quick Summary */}
+                <div className="mt-8 pt-6 border-t border-gray-700">
+                  <h3 className="text-lg font-medium text-white mb-4">
+                    Summary
+                  </h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-gray-700 rounded-lg p-4 text-center border border-gray-600">
+                      <div className="text-2xl font-bold text-white">
+                        {balance}
+                      </div>
+                      <div className="text-sm text-gray-400">Balance</div>
+                    </div>
+                    <div className="bg-gray-700 rounded-lg p-4 text-center border border-gray-600">
+                      <div className="text-2xl font-bold text-white">
+                        {chainInfo.name}
+                      </div>
+                      <div className="text-sm text-gray-400">Network</div>
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div className="border border-purple-500 p-6 rounded-lg">
-              {/*
-              The card to send a transaction
-              Good showcase on how to use states to display more info about the transaction.
-                */}
-              <h2 className="text-2xl font-bold mb-2 text-white">
-                Send a transaction
-              </h2>
-              <h2 className="text-lg">Send 0.01 ETH</h2>
-              <input
-                type="text"
-                placeholder="Recipient Address"
-                value={recipientAddress}
-                onChange={(e) => setRecipientAddress(e.target.value)}
-                className="mt-4 p-2 w-full rounded border border-gray-700 bg-gray-900 text-white focus:outline-none focus:ring-2 focus:ring-purple-400"
-              />
-              <button
-                className="mt-4 bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded transition duration-300 ease-in-out transform hover:scale-105 shadow-lg"
-                onClick={executeTxEvm}
-                disabled={!recipientAddress || isSending}
-              >
-                {isSending ? "Sending..." : "Send 0.01 ETH"}
-              </button>
-              {transactionHash && (
-                <TxNotification
-                  hash={transactionHash}
-                  blockExplorerUrl={chainInfo.blockExplorers?.default.url || ""}
-                />
-              )}
-            </div>
-            <div className="border border-purple-500 p-6 rounded-lg">
-              {/*
-            The card where the user can sign a message
-              */}
-              <h2 className="text-2xl font-bold mb-2">Sign a Message</h2>
-              <p className="text-lf">Pick a provider to sign with:</p>
-              <select
-                value={selectedProvider}
-                onChange={(e) => setSelectedProvider(e.target.value)}
-                className="mt-4 p-2 w-full rounded border border-gray-700 bg-gray-900 text-white focus:outline-none focus:ring-2 focus:ring-purple-400"
-              >
-                <option value="ethers">Ethers Provider</option>
-                <option value="particle">Particle Auth</option>
-              </select>
-              <button
-                className="mt-4 bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded transition duration-300 ease-in-out transform hover:scale-105 shadow-lg"
-                onClick={
-                  selectedProvider === "ethers"
-                    ? signMessageEthers
-                    : signMessageParticle
-                }
-              >
-                Sign Message
-              </button>
             </div>
           </div>
         )}
-        <LinksGrid />
-      </main>
+      </div>
     </div>
   );
 };
